@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from api.salling import search_all_nearby_stores
 from api.tjek import search_offers, get_chain_coverage
+from api.ai_filter import filter_and_enrich, get_anthropic_key
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -79,6 +80,25 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
 .badge-tjek { background: #E0F2F1; color: #00695C; }
 .dist-tag { font-size: 0.73rem; color: #aaa; }
 .valid-tag { font-size: 0.7rem; color: #999; }
+.unit-price { font-size: 0.72rem; color: #888; font-style: italic; }
+.price-row-selected { background: #E8F5E9; border-left: 3px solid #2E7D32; }
+.product-desc { color: #777; font-size: 0.76rem; white-space: normal !important; word-wrap: break-word; overflow-wrap: break-word; max-width: 100%; }
+.kurv-box {
+    background: #F9FBF9; border: 1.5px solid #A5D6A7; border-radius: 12px;
+    padding: 0.8rem 1rem; margin-bottom: 1rem;
+}
+.kurv-header { font-weight: 700; font-size: 0.95rem; color: #1B5E20; margin-bottom: 0.5rem; }
+.kurv-row {
+    display: grid; grid-template-columns: 1fr auto auto;
+    align-items: center; gap: 8px;
+    padding: 0.3rem 0; border-bottom: 1px solid #E8F5E9; font-size: 0.88rem;
+}
+.kurv-row:last-of-type { border-bottom: none; }
+.kurv-total {
+    text-align: right; font-weight: 700; font-size: 1rem;
+    color: #1B5E20; margin-top: 0.5rem; padding-top: 0.4rem;
+    border-top: 2px solid #A5D6A7;
+}
 
 .gps-ok {
     background: linear-gradient(135deg,#E8F5E9,#DCEDC8);
@@ -192,7 +212,7 @@ def add_items(names):
     count = 0
     for n in names:
         if n.lower() not in existing:
-            st.session_state["shopping_items"].append({"name": n, "bought": False, "prices": [], "searched": False})
+            st.session_state["shopping_items"].append({"name": n, "bought": False, "prices": [], "searched": False, "selected_prices": [], "selected_price": None})
             count += 1
     return count
 
@@ -226,7 +246,7 @@ salling_key = get_salling_key()
 
 # ── API status ────────────────────────────────────────────────────────────────
 with st.expander("⚙️ API-status", expanded=not salling_key):
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     with c1:
         if salling_key:
             st.success("✅ **Salling API**\nNetto · Føtex · Bilka\n*(realtidspriser)*")
@@ -237,7 +257,13 @@ with st.expander("⚙️ API-status", expanded=not salling_key):
                 salling_key = manual
     with c2:
         st.success("✅ **eTilbudsavis/Tjek**\nRema · Lidl · Aldi m.fl.\n*(ugentlige tilbud, ingen nøgle)*")
-    st.caption("Permanent nøgle: opret `.streamlit/secrets.toml` med `SALLING_API_KEY = \"...\"`")
+    with c3:
+        anthropic_key = get_anthropic_key()
+        if anthropic_key:
+            st.success("✅ **AI-filter aktiv**\nFiltrerer irrelevante\nresultater fra søgninger")
+        else:
+            st.info("🤖 **AI-filter inaktivt**\nTilføj ANTHROPIC_API_KEY\ni secrets for bedre søgning")
+    st.caption("Permanent nøgle: .streamlit/secrets.toml med SALLING_API_KEY og ANTHROPIC_API_KEY")
 
 st.divider()
 
@@ -338,7 +364,7 @@ if st.session_state["shopping_items"]:
                     all_p.extend(tjek_res)
                     st.caption(f"🟢 Tjek/eTilbudsavis: {len(tjek_res)} resultater for '{q}'")
 
-                    # Dedupliker & sortér
+                    # Dedupliker
                     seen, deduped = set(), []
                     for r in all_p:
                         k = (r["store"].lower()[:20], round(r["price"], 2))
@@ -347,9 +373,16 @@ if st.session_state["shopping_items"]:
                             deduped.append(r)
                     deduped.sort(key=lambda x: x["price"])
 
-                    idx = next(i for i, it in enumerate(st.session_state["shopping_items"]) if it["name"] == item["name"])
-                    st.session_state["shopping_items"][idx]["prices"] = deduped
-                    st.session_state["shopping_items"][idx]["searched"] = True
+                    # AI-filtrering (hvis Anthropic-nøgle findes)
+                    prog.progress((step + 0.8) / len(unsearched), text=f"🤖 AI-filtrerer: {q}...")
+                    filtered = filter_and_enrich(q, deduped)
+                    # Fallback: hvis AI fjernede ALT, brug ufiltrerede resultater
+                    if not filtered and deduped:
+                        filtered = deduped
+
+                    item_idx = next(i for i, it in enumerate(st.session_state["shopping_items"]) if it["name"] == item["name"])
+                    st.session_state["shopping_items"][item_idx]["prices"] = filtered
+                    st.session_state["shopping_items"][item_idx]["searched"] = True
                     prog.progress((step + 1) / len(unsearched), text=f"✅ {q}")
 
                 prog.empty()
@@ -363,67 +396,158 @@ if st.session_state["shopping_items"]:
     st.divider()
     st.markdown("### 🧺 Din liste")
 
-    for idx, item in enumerate(st.session_state["shopping_items"]):
-        bc = "bought" if item["bought"] else ""
-
-        rows_html = ""
-        if item["searched"] and item["prices"]:
-            for p in item["prices"][:6]:
-                src = p.get("source", "tjek")
-                is_off = p.get("is_offer", False)
-                orig = p.get("original_price")
-                dist = p.get("distance_km")
-                valid = fmt_valid(p.get("valid_until", ""))
-
-                # Escape dynamisk indhold for at undgå HTML-brud
-                e_brand = _html_escape.escape(str(p.get("brand") or p["store"]))
-                e_store = _html_escape.escape(str(p["store"]))
-                e_prod  = _html_escape.escape(str(p["product_name"]))
-                e_name  = _html_escape.escape(str(item["name"]))
-
-                badge_src = ('<span class="badge badge-salling">Salling</span>'
-                             if src == "salling"
-                             else '<span class="badge badge-tjek">Tilbudsavis</span>')
-                badge_off = '<span class="badge badge-offer">Tilbud</span>' if is_off else ""
-                orig_html = f'<span class="orig-price">{orig:.2f} kr</span>' if orig else ""
-                dist_html = f'<span class="dist-tag">{dist} km</span>' if dist else ""
-                valid_html = f'<span class="valid-tag">{valid}</span>' if valid else ""
-                ptag = "price-tag offer" if is_off else "price-tag"
-
-                rows_html += f"""
-                <div class="price-row">
-                  <div class="store-info">
-                    <span class="store-name">{e_brand} — {e_store} {dist_html}</span>
-                    <span class="product-desc">{e_prod} {valid_html}</span>
-                  </div>
-                  <div class="price-right">
-                    {orig_html}<span class="{ptag}">{p['price']:.2f} kr</span>{badge_off}{badge_src}
-                  </div>
-                </div>"""
-        elif item["searched"]:
-            rows_html = '<div class="no-results">Ingen resultater fundet i dit område</div>'
+    # ── Kurv-oversigt ──────────────────────────────────────────────────────────
+    # Saml alle valgte og købte varer
+    kurv_rows_list = []
+    total = 0.0
+    for it in st.session_state["shopping_items"]:
+        bought_flag = it.get("bought", False)
+        sps = it.get("selected_prices", []) or ([it["selected_price"]] if it.get("selected_price") else [])
+        if not bought_flag and not sps:
+            continue
+        status = "✅" if bought_flag else "🛒"
+        e_name = _html_escape.escape(it["name"])
+        if sps:
+            for sp in sps:
+                e_store = _html_escape.escape(sp.get("store", ""))
+                price = sp.get("price", 0)
+                total += price
+                kurv_rows_list.append(
+                    f'<div class="kurv-row">' +
+                    f'<span>{status} <b>{e_name}</b></span>' +
+                    f'<span style="color:#555;font-size:.82rem">{e_store}</span>' +
+                    f'<span class="price-tag" style="font-size:.9rem">{price:.2f} kr</span>' +
+                    f'</div>'
+                )
         else:
-            rows_html = '<div class="not-searched">Søg priser for at se resultater</div>'
+            kurv_rows_list.append(
+                f'<div class="kurv-row">' +
+                f'<span>{status} <b>{e_name}</b></span>' +
+                f'<span style="color:#aaa;font-size:.82rem">Ingen butik valgt</span>' +
+                f'<span></span></div>'
+            )
 
-        e_item_name = _html_escape.escape(str(item['name']))
-        card_html = f'<div class="item-card {bc}"><div class="item-name {bc}">{e_item_name}</div>{rows_html}</div>'
-        st.html(card_html)
+    if kurv_rows_list:
+        kurv_rows_html = "".join(kurv_rows_list)
+        total_html = f'<div class="kurv-total">I alt: {total:.2f} kr</div>' if total > 0 else ""
+        st.html(
+            '<div class="kurv-box">' +
+            f'<div class="kurv-header">🛒 Kurv ({len(kurv_rows_list)} valgte)</div>' +
+            kurv_rows_html + total_html +
+            '</div>'
+        )
+        st.markdown("")
 
+    for idx, item in enumerate(st.session_state["shopping_items"]):
+        bought = item["bought"]
+        # selected_prices er nu en LISTE af valgte varer (multi-select)
+        if "selected_prices" not in item:
+            item["selected_prices"] = []
+        selected_prices = item["selected_prices"]
+        bc = "bought" if bought else ""
+        e_item_name = _html_escape.escape(str(item["name"]))
+
+        # ── Varekort header ──
+        st.html(f'<div class="item-card {bc}"><div class="item-name {bc}">{e_item_name}</div></div>')
+
+        if item["searched"] and item["prices"]:
+            for pidx, p in enumerate(item["prices"][:6]):
+                src        = p.get("source", "tjek")
+                is_off     = p.get("is_offer", False)
+                orig       = p.get("original_price")
+                dist       = p.get("distance_km")
+                valid      = fmt_valid(p.get("valid_until", ""))
+                unit_price = p.get("unit_price")
+
+                raw_brand = p.get("display_brand") or p.get("brand") or p["store"]
+                raw_prod  = p.get("display_name") or p.get("product_name", "")
+                raw_qty   = p.get("display_qty") or p.get("unit", "")
+                if raw_qty in ("g", "kg", "ml", "l", "stk", "pk", ""):
+                    raw_qty = ""
+
+                desc_parts   = [raw_prod] + ([raw_qty] if raw_qty else [])
+                display_desc = " · ".join(x for x in desc_parts if x)
+
+                e_brand      = _html_escape.escape(str(raw_brand))
+                e_store      = _html_escape.escape(str(p["store"]))
+                e_prod       = _html_escape.escape(display_desc)
+                e_unit_price = _html_escape.escape(str(unit_price)) if unit_price else ""
+
+                badge_src  = "Salling" if src == "salling" else "Tilbudsavis"
+                badge_cls  = "badge-salling" if src == "salling" else "badge-tjek"
+                badge_off  = '<span class="badge badge-offer">Tilbud</span>' if is_off else ""
+                orig_html  = f'<span class="orig-price">{orig:.2f} kr</span>' if orig else ""
+                dist_html  = f'<span class="dist-tag">{dist} km</span>' if dist else ""
+                valid_html = f'<span class="valid-tag">{valid}</span>' if valid else ""
+                ptag       = "price-tag offer" if is_off else "price-tag"
+                unit_html  = f'<span class="unit-price">{e_unit_price}</span>' if e_unit_price else ""
+
+                # Er denne vare i de valgte?
+                p_key = f'{p.get("store","")}_{p.get("price",0)}_{p.get("product_name","")}' 
+                is_selected = any(
+                    f'{s.get("store","")}_{s.get("price",0)}_{s.get("product_name","")}' == p_key
+                    for s in selected_prices
+                )
+                row_cls = " price-row-selected" if is_selected else ""
+
+                st.html(
+                    f'<div class="price-row{row_cls}">' +
+                    f'  <div class="store-info">' +
+                    f'    <span class="store-name">{e_brand} — {e_store} {dist_html}</span>' +
+                    f'    <span class="product-desc">{e_prod} {valid_html}</span>' +
+                    f'  </div>' +
+                    f'  <div class="price-right">' +
+                    f'    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:1px">' +
+                    f'      <div>{orig_html}<span class="{ptag}">{p["price"]:.2f} kr</span>' +
+                    f'        {badge_off}<span class="badge {badge_cls}">{badge_src}</span></div>' +
+                    f'      {unit_html}' +
+                    f'    </div>' +
+                    f'  </div>' +
+                    f'</div>'
+                )
+
+                cb_label = f"{'✅' if is_selected else '☐'} {p['store']} – {p['price']:.2f} kr"
+                checked = st.checkbox(cb_label, value=is_selected, key=f"sel_{idx}_{pidx}")
+                if checked and not is_selected:
+                    st.session_state["shopping_items"][idx]["selected_prices"].append(p)
+                    st.rerun()
+                elif not checked and is_selected:
+                    st.session_state["shopping_items"][idx]["selected_prices"] = [
+                        s for s in selected_prices
+                        if f'{s.get("store","")}_{s.get("price",0)}_{s.get("product_name","")}' != p_key
+                    ]
+                    st.rerun()
+
+        elif item["searched"]:
+            st.html('<div class="no-results" style="padding:0.4rem 0.6rem">Ingen resultater fundet</div>')
+        else:
+            st.html('<div class="not-searched" style="padding:0.4rem 0.6rem">Søg priser for at se resultater</div>')
+
+        # ── Handlingsknapper ──
         k1, k2, k3 = st.columns([3, 2, 1])
         with k1:
-            lbl = "✅ Lagt i kurv" if item["bought"] else "☑️ Læg i kurv"
+            if bought:
+                lbl = "✅ Lagt i kurv"
+            elif selected_prices:
+                lbl = f"🛒 Læg i kurv ({len(selected_prices)} valgt)"
+            else:
+                lbl = "☑️ Marker som købt"
             if st.button(lbl, key=f"b{idx}", use_container_width=True):
-                st.session_state["shopping_items"][idx]["bought"] = not item["bought"]
+                st.session_state["shopping_items"][idx]["bought"] = not bought
                 st.rerun()
         with k2:
             if item["searched"]:
                 if st.button("🔄 Søg igen", key=f"r{idx}", use_container_width=True):
                     st.session_state["shopping_items"][idx]["searched"] = False
+                    st.session_state["shopping_items"][idx]["selected_prices"] = []
                     st.rerun()
         with k3:
             if st.button("✕", key=f"d{idx}", use_container_width=True, help="Fjern"):
                 st.session_state["shopping_items"].pop(idx)
                 st.rerun()
+
+        st.markdown("---")
+
 
 else:
     st.html("""
